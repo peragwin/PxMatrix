@@ -26,7 +26,12 @@ BSD license, check license.txt for more information
 #define PxMATRIX_DEFAULT_SHOWTIME 30
 #endif
 
-//#define double_buffer
+#ifndef PxMATRIX_SPI_SPEED
+#define PxMATRIX_SPI_SPEED 40000000
+#endif
+
+#define double_buffer
+#define ACTIVE_BUFFER_LOCK_TIMEOUT 1000
 
 #include "Adafruit_GFX.h"
 #include "Arduino.h"
@@ -101,7 +106,7 @@ enum driver_chips {SHIFT, FM6124, FM6126A};
 #define color_third_step (int(color_step / 3))
 #define color_two_third_step (int(color_third_step*2))
 
-#define buffer_size (max_matrix_pixels * 3 / 8)
+#define PX_BUFFER_SIZE (max_matrix_pixels * 3 / 8)
 
 class PxMATRIX : public Adafruit_GFX {
  public:
@@ -153,7 +158,7 @@ class PxMATRIX : public Adafruit_GFX {
   inline void setFastUpdate(bool fast_update);
 
   // When using double buffering, this displays the draw buffer
-  inline void showBuffer();
+  inline int showBuffer();
 
   // Control the minimum color values that result in an active pixel
   inline void setColorOffset(uint8_t r, uint8_t g,uint8_t b);
@@ -177,9 +182,9 @@ class PxMATRIX : public Adafruit_GFX {
  private:
 
  // the display buffer for the LED matrix
-  uint8_t PxMATRIX_buffer[PxMATRIX_COLOR_DEPTH][buffer_size];
+  uint8_t PxMATRIX_buffer[PxMATRIX_COLOR_DEPTH][PX_BUFFER_SIZE];
 #ifdef double_buffer
-  uint8_t PxMATRIX_buffer2[PxMATRIX_COLOR_DEPTH][buffer_size];
+  uint8_t PxMATRIX_buffer2[PxMATRIX_COLOR_DEPTH][PX_BUFFER_SIZE];
 #endif
 
   // GPIO pins
@@ -230,6 +235,8 @@ class PxMATRIX : public Adafruit_GFX {
 
   // This is for double buffering
   bool _active_buffer;
+  bool _pend_buffer_swap;
+  SemaphoreHandle_t _active_buffer_lock;
 
   // Hols configuration
   bool _rotate;
@@ -304,6 +311,8 @@ inline void PxMATRIX::init(uint16_t width, uint16_t height,uint8_t LATCH, uint8_
   _panel_width_bytes = (_width/_panels_width)/8;
 
   _active_buffer=false;
+  _active_buffer_lock = xSemaphoreCreateBinary();
+  xSemaphoreGive(_active_buffer_lock);
 
   _color_R_offset=0;
   _color_G_offset=0;
@@ -523,8 +532,13 @@ inline void PxMATRIX::drawPixel(int16_t x, int16_t y, uint16_t color) {
   drawPixelRGB565(x, y, color);
 }
 
-inline void PxMATRIX::showBuffer() {
-  _active_buffer=!_active_buffer;
+inline int PxMATRIX::showBuffer() {
+  // if ( xSemaphoreTake(_active_buffer_lock, ACTIVE_BUFFER_LOCK_TIMEOUT) == pdFALSE ) return -1;
+  // _active_buffer=!_active_buffer;
+  bool cv = _pend_buffer_swap;
+  _pend_buffer_swap = true;
+  // xSemaphoreGive(_active_buffer_lock);
+  return cv;
 }
 
 inline void PxMATRIX::setColorOffset(uint8_t r, uint8_t g,uint8_t b)
@@ -651,7 +665,7 @@ inline void PxMATRIX::fillMatrixBuffer(int16_t x, int16_t y, uint8_t r, uint8_t 
   if ((_scan_pattern==ZAGGIZ) && ((y%(_row_pattern*2))<_row_pattern))
       bit_select = 7-bit_select;
 
-  uint8_t (*PxMATRIX_bufferp)[PxMATRIX_COLOR_DEPTH][buffer_size] = &PxMATRIX_buffer;
+  uint8_t (*PxMATRIX_bufferp)[PxMATRIX_COLOR_DEPTH][PX_BUFFER_SIZE] = &PxMATRIX_buffer;
 
 #ifdef double_buffer
   PxMATRIX_bufferp = selected_buffer ? &PxMATRIX_buffer2 : &PxMATRIX_buffer;
@@ -730,7 +744,7 @@ void PxMATRIX::spi_init(){
 
     SPI.setDataMode(SPI_MODE0);
     SPI.setBitOrder(MSBFIRST);
-    SPI.setFrequency(20000000);
+    SPI.setFrequency(PxMATRIX_SPI_SPEED);
 
 }
 
@@ -902,13 +916,26 @@ void PxMATRIX::display(uint16_t show_time) {
   ESP.wdtFeed();
 #endif
 
-uint8_t (*bufferp)[PxMATRIX_COLOR_DEPTH][buffer_size] = &PxMATRIX_buffer;
+uint8_t (*bufferp)[PxMATRIX_COLOR_DEPTH][PX_BUFFER_SIZE] = &PxMATRIX_buffer;
 
 #ifdef double_buffer
+
+  if (_display_color == 0) {
+    //if ( xSemaphoreTake(_active_buffer_lock, ACTIVE_BUFFER_LOCK_TIMEOUT) == pdFALSE ) {
+    //  Serial.println("Display failed to get active lock");
+    //  return;
+    //}
+      if (_pend_buffer_swap) {
+        _pend_buffer_swap = false;
+        _active_buffer = !_active_buffer;
+      }
+  }
+
   if(_active_buffer)
     bufferp=&PxMATRIX_buffer2;
   else
     bufferp=&PxMATRIX_buffer;
+
 #endif
 
   for (uint8_t i=0;i<_row_pattern;i++)
@@ -1016,6 +1043,10 @@ uint8_t (*bufferp)[PxMATRIX_COLOR_DEPTH][buffer_size] = &PxMATRIX_buffer;
   if (_display_color>=PxMATRIX_COLOR_DEPTH)
   {
     _display_color=0;
+    // #ifdef double_buffer
+    //   xSemaphoreGive(_active_buffer_lock);
+    //   taskYIELD();
+    // #endif
   }
 }
 
@@ -1118,11 +1149,11 @@ void PxMATRIX::clearDisplay(void) {
 void PxMATRIX::clearDisplay(bool selected_buffer) {
 #ifdef double_buffer
   if(selected_buffer)
-    memset(PxMATRIX_buffer2, 0, PxMATRIX_COLOR_DEPTH*buffer_size);
+    memset(PxMATRIX_buffer2, 0, PxMATRIX_COLOR_DEPTH*PX_BUFFER_SIZE);
   else
-    memset(PxMATRIX_buffer, 0, PxMATRIX_COLOR_DEPTH*buffer_size);
+    memset(PxMATRIX_buffer, 0, PxMATRIX_COLOR_DEPTH*PX_BUFFER_SIZE);
 #else
-    memset(PxMATRIX_buffer, 0, PxMATRIX_COLOR_DEPTH*buffer_size);
+    memset(PxMATRIX_buffer, 0, PxMATRIX_COLOR_DEPTH*PX_BUFFER_SIZE);
 #endif
 }
 #endif
